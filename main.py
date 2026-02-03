@@ -46,7 +46,7 @@ class StudentRecord:
     usn: str
     name: str
     roll: str
-    marks: List[str]
+    marks: dict[str, str]
 
 
 class PdfTextExtractorError(RuntimeError):
@@ -147,26 +147,34 @@ def normalize_lines(text: str) -> List[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def parse_records(pages: Sequence[Sequence[str]]) -> List[StudentRecord]:
+def parse_records(
+    pages: Sequence[Sequence[str]],
+    course_map: dict[str, str],
+) -> List[StudentRecord]:
     records: List[StudentRecord] = []
     for lines in pages:
-        records.extend(parse_page_records(lines))
+        records.extend(parse_page_records(lines, course_map))
     return records
 
 
-def parse_page_records(lines: Sequence[str]) -> List[StudentRecord]:
+def parse_page_records(
+    lines: Sequence[str],
+    course_map: dict[str, str],
+) -> List[StudentRecord]:
     records: List[StudentRecord] = []
     usn_indexes = [idx for idx, line in enumerate(lines) if line == "USN"]
     for usn_idx in usn_indexes:
         usn = lines[usn_idx + 1] if usn_idx + 1 < len(lines) else ""
         if not USN_PATTERN.fullmatch(usn):
             continue
+        course_codes = find_course_codes(lines, usn_idx)
         roll = find_roll_number(lines, usn_idx)
         name = find_student_name(lines, usn_idx)
         totals = find_totals(lines, usn_idx)
-        if not roll or not name or not totals:
+        if not roll or not name or not totals or not course_codes:
             continue
-        records.append(StudentRecord(usn=usn, name=name, roll=roll, marks=totals))
+        marks = map_marks(course_codes, totals, course_map)
+        records.append(StudentRecord(usn=usn, name=name, roll=roll, marks=marks))
     return records
 
 
@@ -224,30 +232,90 @@ def find_totals(lines: Sequence[str], usn_idx: int) -> List[str]:
     return totals
 
 
-def build_headers(records: Iterable[StudentRecord]) -> List[str]:
-    max_marks = max((len(record.marks) for record in records), default=0)
-    subject_headers = [f"Subject_{idx + 1}" for idx in range(max_marks - 1)]
-    headers = ["USN", "Name", "Roll"] + subject_headers
-    if max_marks:
+def find_course_codes(lines: Sequence[str], usn_idx: int) -> List[str]:
+    try:
+        sub_idx = lines.index("Sub", max(0, usn_idx - 200), usn_idx)
+    except ValueError:
+        return []
+    raw_codes = lines[sub_idx + 1 : usn_idx]
+    return combine_course_code_lines(raw_codes)
+
+
+def combine_course_code_lines(lines: Sequence[str]) -> List[str]:
+    combined: List[str] = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if "-" in line:
+            if line.endswith("-") and idx + 1 < len(lines):
+                combined.append(f"{line}{lines[idx + 1]}")
+                idx += 2
+                continue
+            combined.append(line)
+        idx += 1
+    return combined
+
+
+def map_marks(
+    course_codes: Sequence[str],
+    totals: Sequence[str],
+    course_map: dict[str, str],
+) -> dict[str, str]:
+    marks: dict[str, str] = {}
+    for code, total in zip(course_codes, totals):
+        course_name = course_map.get(code, code)
+        marks[course_name] = total
+    return marks
+
+
+def parse_course_catalog(lines: Sequence[str]) -> tuple[dict[str, str], List[str]]:
+    course_map: dict[str, str] = {}
+    course_order: List[str] = []
+    idx = 0
+    while idx < len(lines):
+        line = lines[idx]
+        if line.isdigit() and idx + 2 < len(lines):
+            code_line = lines[idx + 1]
+            name_line = lines[idx + 2]
+            if "-" in code_line:
+                if code_line.endswith("-") and idx + 3 < len(lines):
+                    code = f"{code_line}{lines[idx + 2]}"
+                    name = lines[idx + 3]
+                    idx += 4
+                else:
+                    code = code_line
+                    name = name_line
+                    idx += 3
+                course_map[code] = name
+                course_order.append(name)
+                continue
+        idx += 1
+    return course_map, course_order
+
+
+def build_headers(course_order: Sequence[str]) -> List[str]:
+    headers = ["USN", "Name", "Roll"] + list(course_order)
+    if course_order:
         headers.append("Total")
     return headers
 
 
-def write_csv(output_path: Path, records: Sequence[StudentRecord]) -> None:
-    headers = build_headers(records)
+def write_csv(
+    output_path: Path, records: Sequence[StudentRecord], course_order: Sequence[str]
+) -> None:
+    headers = build_headers(course_order)
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(headers)
         for record in records:
             row = [record.usn, record.name, record.roll]
             if headers[-1:] == ["Total"]:
-                subject_count = len(headers) - 4
-                subjects = record.marks[:subject_count]
+                subject_names = headers[3:-1]
+                subjects = [record.marks.get(name, "") for name in subject_names]
                 row.extend(subjects)
-                row.extend([""] * (subject_count - len(subjects)))
                 row.append(f"{sum(to_float(value) for value in subjects):.2f}")
             else:
-                row.extend(record.marks)
+                row.extend(record.marks.values())
             writer.writerow(row)
 
 
@@ -267,11 +335,12 @@ def main() -> None:
     args = parser.parse_args()
 
     pages = extract_pdf_pages(args.input)
-    records = parse_records(pages)
+    course_map, course_order = parse_course_catalog(pages[0])
+    records = parse_records(pages, course_map)
     if not records:
         raise SystemExit("No student records found. Check PDF format.")
 
-    write_csv(args.output, records)
+    write_csv(args.output, records, course_order)
     print(f"Wrote {len(records)} records to {args.output}")
 
 
