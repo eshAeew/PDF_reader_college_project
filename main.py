@@ -243,13 +243,19 @@ def write_csv(output_path: Path, records: Sequence[StudentRecord]) -> None:
             if headers[-1:] == ["Total"]:
                 subject_count = len(headers) - 4
                 subjects = record.marks[:subject_count]
-                total = record.marks[subject_count : subject_count + 1]
                 row.extend(subjects)
                 row.extend([""] * (subject_count - len(subjects)))
-                row.extend(total if total else [""])
+                row.append(f"{sum(to_float(value) for value in subjects):.2f}")
             else:
                 row.extend(record.marks)
             writer.writerow(row)
+
+
+def to_float(value: str) -> float:
+    try:
+        return float(value)
+    except ValueError:
+        return 0.0
 
 
 def main() -> None:
