@@ -4,8 +4,8 @@ This script scans a PDF for student records containing:
 - USN
 - Name
 - Roll number
-- Subject marks
-- Total (last numeric value)
+- Subject totals
+- Overall total (last numeric value)
 
 Usage:
   python main.py --input PDF.pdf --output students.csv
@@ -16,16 +16,29 @@ from __future__ import annotations
 import argparse
 import csv
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Sequence
 
 
-USN_PATTERN = re.compile(r"\b[A-Z0-9]{6,12}\b")
-ROLL_PATTERN = re.compile(r"\b\d{1,4}\b")
-NUMBER_PATTERN = re.compile(r"\b\d{1,3}\b")
+USN_PATTERN = re.compile(r"\bU[A-Z0-9]{9,12}\b")
+ROLL_PATTERN = re.compile(r"\b\d{4,6}\b")
+NUMBER_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\b")
 NAME_CLEAN_PATTERN = re.compile(r"[^A-Za-z .'-]")
+TEXT_STRING_PATTERN = re.compile(rb"\((?:\\.|[^\\)])*\)")
+PAGE_LABELS = {
+    "Bangalore University",
+    "Tabulation Register for",
+    "Bachelor of Computer Applications",
+    "Semester :",
+    "Exam Month :",
+    "Discipline :",
+    "Printed Date:",
+    "Class",
+    "Max. Total",
+    "Term Grade:",
+    "Letter Grade",
+}
 
 
 @dataclass
@@ -37,110 +50,178 @@ class StudentRecord:
 
 
 class PdfTextExtractorError(RuntimeError):
-    """Raised when no PDF text extraction method is available."""
+    """Raised when PDF parsing fails."""
 
 
-def extract_text(pdf_path: Path) -> str:
-    """Extract text from a PDF using available local tools."""
+def extract_pdf_pages(pdf_path: Path) -> List[List[str]]:
+    """Extract per-page lines using a minimal PDF parser."""
+    data = pdf_path.read_bytes()
+    objects = _parse_objects(data)
+    pages_root = _find_pages_root(objects)
+    page_ids = _walk_pages(objects, pages_root)
+
+    pages: List[List[str]] = []
+    for page_id in page_ids:
+        content_ids = _page_content_ids(objects[page_id])
+        page_text = _extract_page_text(objects, content_ids)
+        pages.append(normalize_lines(page_text))
+    return pages
+
+
+def _parse_objects(data: bytes) -> dict[int, bytes]:
+    pattern = re.compile(rb"(\d+)\s+(\d+)\s+obj(.*?)endobj", re.S)
+    return {int(m.group(1)): m.group(3) for m in pattern.finditer(data)}
+
+
+def _find_pages_root(objects: dict[int, bytes]) -> int:
+    for obj_num, obj_body in objects.items():
+        if b"/Type /Catalog" in obj_body:
+            match = re.search(rb"/Pages\s+(\d+)\s+0\s+R", obj_body)
+            if match:
+                return int(match.group(1))
+    raise PdfTextExtractorError("Failed to locate /Pages root in PDF.")
+
+
+def _walk_pages(objects: dict[int, bytes], obj_num: int) -> List[int]:
+    obj_body = objects[obj_num]
+    if b"/Type /Page" in obj_body and b"/Type /Pages" not in obj_body:
+        return [obj_num]
+    kids = re.search(rb"/Kids\s*\[(.*?)\]", obj_body, re.S)
+    if not kids:
+        return []
+    page_ids: List[int] = []
+    for kid in re.findall(rb"(\d+)\s+0\s+R", kids.group(1)):
+        page_ids.extend(_walk_pages(objects, int(kid)))
+    return page_ids
+
+
+def _page_content_ids(page_body: bytes) -> List[int]:
+    content_ids = re.findall(rb"/Contents\s+(\d+)\s+0\s+R", page_body)
+    if content_ids:
+        return [int(x) for x in content_ids]
+    array_match = re.search(rb"/Contents\s*\[(.*?)\]", page_body, re.S)
+    if array_match:
+        return [int(x) for x in re.findall(rb"(\d+)\s+0\s+R", array_match.group(1))]
+    return []
+
+
+def _extract_page_text(objects: dict[int, bytes], content_ids: Iterable[int]) -> str:
+    parts: List[str] = []
+    for content_id in content_ids:
+        obj_body = objects.get(content_id, b"")
+        stream_match = re.search(rb"stream\r?\n(.*?)endstream", obj_body, re.S)
+        if not stream_match:
+            continue
+        stream = stream_match.group(1)
+        if b"FlateDecode" in obj_body:
+            stream = _inflate_stream(stream)
+        parts.extend(_decode_text_strings(stream))
+    return "\n".join(parts)
+
+
+def _inflate_stream(stream: bytes) -> bytes:
+    import zlib
+
     try:
-        from pypdf import PdfReader  # type: ignore
-
-        return _extract_with_pypdf(pdf_path, PdfReader)
-    except ImportError:
-        try:
-            from PyPDF2 import PdfReader  # type: ignore
-
-            return _extract_with_pypdf(pdf_path, PdfReader)
-        except ImportError:
-            return _extract_with_pdftotext(pdf_path)
+        return zlib.decompress(stream)
+    except zlib.error as exc:
+        raise PdfTextExtractorError("Failed to decompress PDF content stream.") from exc
 
 
-def _extract_with_pypdf(pdf_path: Path, reader_cls) -> str:
-    reader = reader_cls(str(pdf_path))
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n".join(pages)
+def _decode_text_strings(stream: bytes) -> List[str]:
+    decoded: List[str] = []
+    for match in TEXT_STRING_PATTERN.finditer(stream):
+        raw = match.group(0)[1:-1]
+        decoded.append(_decode_pdf_string(raw))
+    return decoded
 
 
-def _extract_with_pdftotext(pdf_path: Path) -> str:
-    try:
-        result = subprocess.run(
-            ["pdftotext", str(pdf_path), "-"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise PdfTextExtractorError(
-            "No PDF parser available. Install 'pypdf' or 'PyPDF2', "
-            "or install the 'pdftotext' utility."
-        ) from exc
-    return result.stdout
+def _decode_pdf_string(raw: bytes) -> str:
+    text = raw.decode("latin-1", errors="ignore")
+    text = text.replace("\\(", "(").replace("\\)", ")").replace("\\\\", "\\")
+    text = text.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+    return text
 
 
 def normalize_lines(text: str) -> List[str]:
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
-def chunk_records(lines: Sequence[str]) -> List[str]:
-    """Group lines so each chunk begins with a USN line."""
-    chunks: List[str] = []
-    current: List[str] = []
-    for line in lines:
-        if USN_PATTERN.search(line):
-            if current:
-                chunks.append(" ".join(current))
-                current = []
-        current.append(line)
-    if current:
-        chunks.append(" ".join(current))
-    return chunks
-
-
-def parse_record(chunk: str) -> StudentRecord | None:
-    """Parse a single record chunk into a StudentRecord."""
-    usn_match = USN_PATTERN.search(chunk)
-    if not usn_match:
-        return None
-    usn = usn_match.group(0)
-
-    after_usn = chunk[usn_match.end() :].strip()
-    tokens = after_usn.split()
-    if not tokens:
-        return None
-
-    roll = ""
-    name_tokens: List[str] = []
-    marks: List[str] = []
-
-    roll_idx = None
-    for idx, token in enumerate(tokens):
-        if ROLL_PATTERN.fullmatch(token):
-            roll = token
-            roll_idx = idx
-            break
-        name_tokens.append(token)
-
-    if roll_idx is not None:
-        marks = [t for t in tokens[roll_idx + 1 :] if NUMBER_PATTERN.fullmatch(t)]
-
-    name_raw = " ".join(name_tokens).strip()
-    name = NAME_CLEAN_PATTERN.sub("", name_raw).strip()
-
-    if not name or not roll:
-        return None
-
-    return StudentRecord(usn=usn, name=name, roll=roll, marks=marks)
-
-
-def parse_records(text: str) -> List[StudentRecord]:
-    lines = normalize_lines(text)
-    chunks = chunk_records(lines)
+def parse_records(pages: Sequence[Sequence[str]]) -> List[StudentRecord]:
     records: List[StudentRecord] = []
-    for chunk in chunks:
-        record = parse_record(chunk)
-        if record:
-            records.append(record)
+    for lines in pages:
+        records.extend(parse_page_records(lines))
     return records
+
+
+def parse_page_records(lines: Sequence[str]) -> List[StudentRecord]:
+    records: List[StudentRecord] = []
+    usn_indexes = [idx for idx, line in enumerate(lines) if line == "USN"]
+    for usn_idx in usn_indexes:
+        usn = lines[usn_idx + 1] if usn_idx + 1 < len(lines) else ""
+        if not USN_PATTERN.fullmatch(usn):
+            continue
+        roll = find_roll_number(lines, usn_idx)
+        name = find_student_name(lines, usn_idx)
+        totals = find_totals(lines, usn_idx)
+        if not roll or not name or not totals:
+            continue
+        records.append(StudentRecord(usn=usn, name=name, roll=roll, marks=totals))
+    return records
+
+
+def find_roll_number(lines: Sequence[str], usn_idx: int) -> str:
+    for idx in range(usn_idx - 1, -1, -1):
+        candidate = lines[idx]
+        if ROLL_PATTERN.fullmatch(candidate):
+            return candidate
+    return ""
+
+
+def find_student_name(lines: Sequence[str], usn_idx: int) -> str:
+    try:
+        pr_idx = lines.index("Pr", usn_idx)
+    except ValueError:
+        return ""
+    for idx in range(pr_idx - 1, usn_idx, -1):
+        candidate = lines[idx]
+        if candidate in PAGE_LABELS or candidate == "Th":
+            continue
+        if NUMBER_PATTERN.fullmatch(candidate):
+            continue
+        if "+" in candidate:
+            continue
+        name = NAME_CLEAN_PATTERN.sub("", candidate).strip()
+        if name:
+            return name
+    return ""
+
+
+def find_totals(lines: Sequence[str], usn_idx: int) -> List[str]:
+    result_idx = None
+    for idx in range(usn_idx, len(lines)):
+        if lines[idx].startswith("Result:"):
+            result_idx = idx
+            break
+    if result_idx is None:
+        return []
+    total_idx = None
+    for idx in range(result_idx, len(lines)):
+        if lines[idx] == "Total":
+            total_idx = idx
+            break
+    if total_idx is None:
+        return []
+    totals: List[str] = []
+    for idx in range(total_idx + 1, len(lines)):
+        line = lines[idx]
+        if line.startswith("Class") or line.startswith("Max. Total"):
+            break
+        if line.startswith("Term Grade"):
+            break
+        if NUMBER_PATTERN.fullmatch(line):
+            totals.append(line)
+    return totals
 
 
 def build_headers(records: Iterable[StudentRecord]) -> List[str]:
@@ -179,8 +260,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    text = extract_text(args.input)
-    records = parse_records(text)
+    pages = extract_pdf_pages(args.input)
+    records = parse_records(pages)
     if not records:
         raise SystemExit("No student records found. Check PDF format.")
 
