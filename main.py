@@ -26,7 +26,6 @@ ROLL_PATTERN = re.compile(r"\b\d{4,6}\b")
 NUMBER_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\b")
 NAME_CLEAN_PATTERN = re.compile(r"[^A-Za-z .'-]")
 TEXT_STRING_PATTERN = re.compile(rb"\((?:\\.|[^\\)])*\)")
-COURSE_CODE_PATTERN = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+-?$")
 PAGE_LABELS = {
     "Bangalore University",
     "Tabulation Register for",
@@ -153,18 +152,16 @@ def parse_records(
     course_map: dict[str, str],
 ) -> List[StudentRecord]:
     records: List[StudentRecord] = []
-    for page_idx, lines in enumerate(pages):
-        records.extend(parse_page_records(pages, page_idx, course_map))
+    for lines in pages:
+        records.extend(parse_page_records(lines, course_map))
     return records
 
 
 def parse_page_records(
-    pages: Sequence[Sequence[str]],
-    page_idx: int,
+    lines: Sequence[str],
     course_map: dict[str, str],
 ) -> List[StudentRecord]:
     records: List[StudentRecord] = []
-    lines = pages[page_idx]
     usn_indexes = [idx for idx, line in enumerate(lines) if line == "USN"]
     for usn_idx in usn_indexes:
         usn = lines[usn_idx + 1] if usn_idx + 1 < len(lines) else ""
@@ -174,9 +171,6 @@ def parse_page_records(
         roll = find_roll_number(lines, usn_idx)
         name = find_student_name(lines, usn_idx)
         totals = find_totals(lines, usn_idx)
-        if course_codes and len(totals) < len(course_codes):
-            missing = len(course_codes) - len(totals)
-            totals.extend(find_continuation_totals(pages, page_idx + 1, missing))
         if not roll or not name or not totals or not course_codes:
             continue
         marks = map_marks(course_codes, totals, course_map)
@@ -252,15 +246,12 @@ def combine_course_code_lines(lines: Sequence[str]) -> List[str]:
     idx = 0
     while idx < len(lines):
         line = lines[idx]
-        if line in {"Total", "Sub"}:
-            idx += 1
-            continue
-        if is_course_code_fragment(line):
+        if "-" in line:
             if line.endswith("-") and idx + 1 < len(lines):
-                combined.append(normalize_course_code(f"{line}{lines[idx + 1]}"))
+                combined.append(f"{line}{lines[idx + 1]}")
                 idx += 2
                 continue
-            combined.append(normalize_course_code(line))
+            combined.append(line)
         idx += 1
     return combined
 
@@ -286,13 +277,13 @@ def parse_course_catalog(lines: Sequence[str]) -> tuple[dict[str, str], List[str
         if line.isdigit() and idx + 2 < len(lines):
             code_line = lines[idx + 1]
             name_line = lines[idx + 2]
-            if is_course_code_fragment(code_line):
+            if "-" in code_line:
                 if code_line.endswith("-") and idx + 3 < len(lines):
-                    code = normalize_course_code(f"{code_line}{lines[idx + 2]}")
+                    code = f"{code_line}{lines[idx + 2]}"
                     name = lines[idx + 3]
                     idx += 4
                 else:
-                    code = normalize_course_code(code_line)
+                    code = code_line
                     name = name_line
                     idx += 3
                 course_map[code] = name
@@ -300,46 +291,6 @@ def parse_course_catalog(lines: Sequence[str]) -> tuple[dict[str, str], List[str
                 continue
         idx += 1
     return course_map, course_order
-
-
-def find_continuation_totals(
-    pages: Sequence[Sequence[str]], start_page_idx: int, needed: int
-) -> List[str]:
-    totals: List[str] = []
-    for page_idx in range(start_page_idx, len(pages)):
-        lines = pages[page_idx]
-        if "USN" in lines or "Sub" in lines:
-            break
-        totals.extend(extract_totals_from_lines(lines))
-        if len(totals) >= needed:
-            return totals[:needed]
-    return totals
-
-
-def extract_totals_from_lines(lines: Sequence[str]) -> List[str]:
-    totals: List[str] = []
-    total_indexes = [idx for idx, line in enumerate(lines) if line == "Total"]
-    for total_idx in total_indexes:
-        for idx in range(total_idx + 1, len(lines)):
-            line = lines[idx]
-            if line == "Total":
-                break
-            if line.startswith("Class") or line.startswith("Max. Total"):
-                break
-            if line.startswith("Printed Date") or line.startswith("Page"):
-                break
-            if NUMBER_PATTERN.fullmatch(line):
-                totals.append(line)
-    return totals
-
-
-def normalize_course_code(code: str) -> str:
-    return code.replace(" ", "").strip()
-
-
-def is_course_code_fragment(value: str) -> bool:
-    normalized = normalize_course_code(value)
-    return "-" in normalized and bool(COURSE_CODE_PATTERN.fullmatch(normalized))
 
 
 def build_headers(course_order: Sequence[str]) -> List[str]:
