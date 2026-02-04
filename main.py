@@ -26,7 +26,7 @@ ROLL_PATTERN = re.compile(r"\b\d{4,6}\b")
 NUMBER_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\b")
 NAME_CLEAN_PATTERN = re.compile(r"[^A-Za-z .'-]")
 TEXT_STRING_PATTERN = re.compile(rb"\((?:\\.|[^\\)])*\)")
-COURSE_CODE_PATTERN = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)+-?$")
+COURSE_CODE_PATTERN = re.compile(r"^[A-Z0-9/]+(?:-[A-Z0-9/]+)+-?$")
 PAGE_LABELS = {
     "Bangalore University",
     "Tabulation Register for",
@@ -166,14 +166,16 @@ def parse_page_records(
     records: List[StudentRecord] = []
     lines = pages[page_idx]
     usn_indexes = [idx for idx, line in enumerate(lines) if line == "USN"]
-    for usn_idx in usn_indexes:
+    for pos, usn_idx in enumerate(usn_indexes):
         usn = lines[usn_idx + 1] if usn_idx + 1 < len(lines) else ""
         if not USN_PATTERN.fullmatch(usn):
             continue
-        course_codes = find_course_codes(lines, usn_idx)
+        block_end = usn_indexes[pos + 1] if pos + 1 < len(usn_indexes) else len(lines)
+        block_start = find_block_start(lines, usn_idx)
+        course_codes = find_course_codes(lines, block_start, usn_idx)
         roll = find_roll_number(lines, usn_idx)
         name = find_student_name(lines, usn_idx)
-        totals = find_totals(lines, usn_idx, len(course_codes))
+        totals = find_totals(lines, usn_idx, block_end, len(course_codes))
         if totals and len(totals) < len(course_codes):
             missing = len(course_codes) - len(totals)
             totals.extend(find_continuation_totals(pages, page_idx + 1, missing))
@@ -211,27 +213,32 @@ def find_student_name(lines: Sequence[str], usn_idx: int) -> str:
     return ""
 
 
-def find_totals(lines: Sequence[str], usn_idx: int, expected: int) -> List[str]:
+def find_totals(
+    lines: Sequence[str], usn_idx: int, block_end: int, expected: int
+) -> List[str]:
     result_idx = None
-    for idx in range(usn_idx, len(lines)):
+    for idx in range(usn_idx, block_end):
         if lines[idx].startswith("Result:"):
             result_idx = idx
             break
-    if result_idx is None:
-        return []
+    search_start = result_idx if result_idx is not None else usn_idx
     total_idx = None
-    for idx in range(result_idx, len(lines)):
+    for idx in range(search_start, block_end):
         if lines[idx] == "Total":
             total_idx = idx
             break
     if total_idx is None:
         return []
     totals: List[str] = []
-    for idx in range(total_idx + 1, len(lines)):
+    for idx in range(total_idx + 1, block_end):
         line = lines[idx]
         if line.startswith("Class") or line.startswith("Max. Total"):
             break
         if line.startswith("Term Grade"):
+            break
+        if line.startswith("Letter Grade") or line.startswith("M.C.No"):
+            break
+        if line.startswith("Printed Date") or line.startswith("Page"):
             break
         if NUMBER_PATTERN.fullmatch(line):
             totals.append(line)
@@ -240,9 +247,9 @@ def find_totals(lines: Sequence[str], usn_idx: int, expected: int) -> List[str]:
     return totals
 
 
-def find_course_codes(lines: Sequence[str], usn_idx: int) -> List[str]:
+def find_course_codes(lines: Sequence[str], block_start: int, usn_idx: int) -> List[str]:
     try:
-        sub_idx = lines.index("Sub", max(0, usn_idx - 200), usn_idx)
+        sub_idx = lines.index("Sub", block_start, usn_idx)
     except ValueError:
         return []
     raw_codes = lines[sub_idx + 1 : usn_idx]
@@ -344,9 +351,22 @@ def is_course_code_fragment(value: str) -> bool:
     return "-" in normalized and bool(COURSE_CODE_PATTERN.fullmatch(normalized))
 
 
-def build_headers(course_order: Sequence[str]) -> List[str]:
+def find_block_start(lines: Sequence[str], usn_idx: int) -> int:
+    for idx in range(usn_idx, max(-1, usn_idx - 300), -1):
+        if lines[idx] == "Sub":
+            return idx
+    return max(0, usn_idx - 300)
+
+
+def build_headers(
+    course_order: Sequence[str], records: Sequence[StudentRecord]
+) -> List[str]:
     headers = ["USN", "Name", "Roll"] + list(course_order)
-    if course_order:
+    for record in records:
+        for name in record.marks:
+            if name not in headers:
+                headers.append(name)
+    if len(headers) > 3:
         headers.append("Total")
     return headers
 
@@ -354,7 +374,7 @@ def build_headers(course_order: Sequence[str]) -> List[str]:
 def write_csv(
     output_path: Path, records: Sequence[StudentRecord], course_order: Sequence[str]
 ) -> None:
-    headers = build_headers(course_order)
+    headers = build_headers(course_order, records)
     with output_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(headers)
