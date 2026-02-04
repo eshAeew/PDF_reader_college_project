@@ -281,8 +281,7 @@ def map_marks(
 ) -> dict[str, str]:
     marks: dict[str, str] = {}
     for code, total in zip(course_codes, totals):
-        course_name = course_map.get(code, code)
-        marks[course_name] = total
+        marks[code] = total
     return marks
 
 
@@ -305,7 +304,7 @@ def parse_course_catalog(lines: Sequence[str]) -> tuple[dict[str, str], List[str
                     name = name_line
                     idx += 3
                 course_map[code] = name
-                course_order.append(name)
+                course_order.append(code)
                 continue
         idx += 1
     return course_map, course_order
