@@ -269,6 +269,10 @@ def combine_course_code_lines(lines: Sequence[str]) -> List[str]:
                 combined.append(normalize_course_code(f"{line}{lines[idx + 1]}"))
                 idx += 2
                 continue
+            if "/" in line and idx + 1 < len(lines) and lines[idx + 1].isalnum():
+                combined.append(normalize_course_code(f"{line}-{lines[idx + 1]}"))
+                idx += 2
+                continue
             combined.append(normalize_course_code(line))
         idx += 1
     return combined
@@ -300,9 +304,14 @@ def parse_course_catalog(lines: Sequence[str]) -> tuple[dict[str, str], List[str
                     name = lines[idx + 3]
                     idx += 4
                 else:
-                    code = normalize_course_code(code_line)
-                    name = name_line
-                    idx += 3
+                    if "/" in code_line and idx + 3 < len(lines) and name_line.isalnum():
+                        code = normalize_course_code(f"{code_line}-{name_line}")
+                        name = lines[idx + 3]
+                        idx += 4
+                    else:
+                        code = normalize_course_code(code_line)
+                        name = name_line
+                        idx += 3
                 course_map[code] = name
                 course_order.append(code)
                 continue
@@ -347,7 +356,11 @@ def normalize_course_code(code: str) -> str:
 
 def is_course_code_fragment(value: str) -> bool:
     normalized = normalize_course_code(value)
-    return "-" in normalized and bool(COURSE_CODE_PATTERN.fullmatch(normalized))
+    if not normalized:
+        return False
+    if not any(char.isalnum() for char in normalized):
+        return False
+    return "-" in normalized or "/" in normalized
 
 
 def find_block_start(lines: Sequence[str], usn_idx: int) -> int:
