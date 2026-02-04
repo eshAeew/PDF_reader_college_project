@@ -360,8 +360,17 @@ def find_block_start(lines: Sequence[str], usn_idx: int) -> int:
 def build_headers(
     course_order: Sequence[str], records: Sequence[StudentRecord]
 ) -> List[str]:
-    headers = ["USN", "Name", "Roll"] + list(course_order)
-    if course_order:
+    present_codes: List[str] = []
+    for record in records:
+        for code in record.marks:
+            if code not in present_codes:
+                present_codes.append(code)
+    ordered_codes = [code for code in course_order if code in present_codes]
+    for code in present_codes:
+        if code not in ordered_codes:
+            ordered_codes.append(code)
+    headers = ["USN", "Name", "Roll"] + ordered_codes
+    if ordered_codes:
         headers.append("Total")
     return headers
 
@@ -405,6 +414,15 @@ def main() -> None:
     records = parse_records(pages, course_map)
     if not records:
         raise SystemExit("No student records found. Check PDF format.")
+
+    headers = build_headers(course_order, records)
+    present_codes = set(headers[3:-1] if headers[-1:] == ["Total"] else headers[3:])
+    missing_codes = [code for code in course_order if code not in present_codes]
+    if missing_codes:
+        print(
+            "Note: some catalog course codes have no data and were omitted: "
+            + ", ".join(missing_codes)
+        )
 
     write_csv(args.output, records, course_order)
     print(f"Wrote {len(records)} records to {args.output}")
