@@ -360,17 +360,8 @@ def find_block_start(lines: Sequence[str], usn_idx: int) -> int:
 def build_headers(
     course_order: Sequence[str], records: Sequence[StudentRecord]
 ) -> List[str]:
-    present_codes: List[str] = []
-    for record in records:
-        for code in record.marks:
-            if code not in present_codes:
-                present_codes.append(code)
-    ordered_codes = [code for code in course_order if code in present_codes]
-    for code in present_codes:
-        if code not in ordered_codes:
-            ordered_codes.append(code)
-    headers = ["USN", "Name", "Roll"] + ordered_codes
-    if ordered_codes:
+    headers = ["USN", "Name", "Roll"] + list(course_order)
+    if course_order:
         headers.append("Total")
     return headers
 
